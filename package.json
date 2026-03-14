@@ -10,7 +10,8 @@
     "start": "node dist/index.js",
     "register": "tsx src/register-commands.ts",
     "drizzle:generate": "drizzle-kit generate",
-    "drizzle:push": "drizzle-kit push"
+    "drizzle:push": "drizzle-kit push",
+    "inngest:dev": "pnpm dlx inngest-cli@latest dev"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",
