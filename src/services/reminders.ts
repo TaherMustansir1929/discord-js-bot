@@ -1,6 +1,6 @@
 import { and, eq, gte, lt } from "drizzle-orm";
 import cron from "node-cron";
-import type { Client } from "discord.js";
+import type { Client, TextBasedChannel } from "discord.js";
 import { db } from "../db";
 import { goals } from "../db/schema";
 import { formatShortDate } from "../utils/date";
@@ -33,7 +33,7 @@ export function startGoalReminderCron(client: Client) {
       for (const goal of upcoming) {
         try {
           const channel = await client.channels.fetch(goal.channelId);
-          if (!channel || !channel.isTextBased()) {
+          if (!channel || !channel.isTextBased() || !canSend(channel)) {
             continue;
           }
 
@@ -55,4 +55,8 @@ export function startGoalReminderCron(client: Client) {
     },
     { timezone: tz }
   );
+}
+
+function canSend(channel: TextBasedChannel): channel is TextBasedChannel & { send: (...args: any[]) => Promise<any> } {
+  return "send" in channel;
 }

@@ -18,6 +18,17 @@ import { EXPENSE_CATEGORIES, GOAL_STATUSES, INCOME_CATEGORIES } from "./constant
 import { formatShortDate, parseNaturalLanguageDate } from "./utils/date";
 import { renderTable } from "./utils/table";
 
+type GoalStatus = (typeof GOAL_STATUSES)[number];
+type ExpenseCategory = (typeof EXPENSE_CATEGORIES)[number];
+type IncomeCategory = (typeof INCOME_CATEGORIES)[number];
+
+const isGoalStatus = (value: string): value is GoalStatus =>
+  (GOAL_STATUSES as readonly string[]).includes(value);
+const isExpenseCategory = (value: string): value is ExpenseCategory =>
+  (EXPENSE_CATEGORIES as readonly string[]).includes(value);
+const isIncomeCategory = (value: string): value is IncomeCategory =>
+  (INCOME_CATEGORIES as readonly string[]).includes(value);
+
 const pingCommand = new SlashCommandBuilder()
   .setName("ping")
   .setDescription("Check bot latency");
@@ -369,7 +380,12 @@ async function handleGoalCommand(interaction: ChatInputCommandInteraction) {
 
   if (subcommand === "status") {
     const id = interaction.options.getInteger("id", true);
-    const status = interaction.options.getString("status", true);
+    const statusInput = interaction.options.getString("status", true);
+    if (!isGoalStatus(statusInput)) {
+      await interaction.reply({ content: "Invalid goal status.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const status = statusInput;
 
     const updated = await db
       .update(goals)
@@ -537,7 +553,12 @@ async function handleGoalStatusSelect(interaction: Interaction) {
 async function handleGoalStatusButton(interaction: Interaction) {
   if (!interaction.isButton()) return;
 
-  const [, goalId, status] = interaction.customId.split(":");
+  const [, goalId, statusInput] = interaction.customId.split(":");
+  if (!statusInput || !isGoalStatus(statusInput)) {
+    await interaction.reply({ content: "Invalid goal status.", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const status = statusInput;
   const updated = await db
     .update(goals)
     .set({ status, updatedAt: new Date() })
@@ -566,7 +587,12 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
   if (sub === "add") {
     const description = interaction.options.getString("description", true);
     const amount = interaction.options.getNumber("amount", true);
-    const category = interaction.options.getString("category", true);
+    const categoryInput = interaction.options.getString("category", true);
+    if (!isExpenseCategory(categoryInput)) {
+      await interaction.reply({ content: "Invalid expense category.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const category = categoryInput;
     const dateText = interaction.options.getString("date");
     const date = dateText ? parseNaturalLanguageDate(dateText) : new Date();
 
@@ -624,19 +650,25 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
     const id = interaction.options.getInteger("id", true);
     const description = interaction.options.getString("description");
     const amount = interaction.options.getNumber("amount");
-    const category = interaction.options.getString("category");
+    const categoryInput = interaction.options.getString("category");
     const dateText = interaction.options.getString("date");
 
     const updates: {
       description?: string;
       amountPkr?: number;
-      category?: string;
+      category?: ExpenseCategory;
       date?: Date;
     } = {};
 
     if (description) updates.description = description;
     if (amount !== null && amount !== undefined) updates.amountPkr = Math.round(amount);
-    if (category) updates.category = category;
+    if (categoryInput) {
+      if (!isExpenseCategory(categoryInput)) {
+        await interaction.reply({ content: "Invalid expense category.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      updates.category = categoryInput;
+    }
     if (dateText) {
       const parsed = parseNaturalLanguageDate(dateText);
       if (!parsed) {
@@ -693,7 +725,12 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
   if (sub === "add") {
     const description = interaction.options.getString("description", true);
     const amount = interaction.options.getNumber("amount", true);
-    const category = interaction.options.getString("category", true);
+    const categoryInput = interaction.options.getString("category", true);
+    if (!isIncomeCategory(categoryInput)) {
+      await interaction.reply({ content: "Invalid income category.", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const category = categoryInput;
     const dateText = interaction.options.getString("date");
     const date = dateText ? parseNaturalLanguageDate(dateText) : new Date();
 
@@ -751,19 +788,25 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
     const id = interaction.options.getInteger("id", true);
     const description = interaction.options.getString("description");
     const amount = interaction.options.getNumber("amount");
-    const category = interaction.options.getString("category");
+    const categoryInput = interaction.options.getString("category");
     const dateText = interaction.options.getString("date");
 
     const updates: {
       description?: string;
       amountPkr?: number;
-      category?: string;
+      category?: IncomeCategory;
       date?: Date;
     } = {};
 
     if (description) updates.description = description;
     if (amount !== null && amount !== undefined) updates.amountPkr = Math.round(amount);
-    if (category) updates.category = category;
+    if (categoryInput) {
+      if (!isIncomeCategory(categoryInput)) {
+        await interaction.reply({ content: "Invalid income category.", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      updates.category = categoryInput;
+    }
     if (dateText) {
       const parsed = parseNaturalLanguageDate(dateText);
       if (!parsed) {

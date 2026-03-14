@@ -10,10 +10,10 @@ if (!token || !clientId || !guildId) {
   throw new Error("DISCORD_TOKEN, DISCORD_CLIENT_ID, and DISCORD_GUILD_ID are required.");
 }
 
-const rest = new REST({ version: "10" }).setToken(token);
+const rest = new REST({ version: "10" }).setToken(token!);
 
 async function register() {
-  await rest.put(Routes.applicationGuildCommands(clientId, guildId), {
+  await rest.put(Routes.applicationGuildCommands(clientId!, guildId!), {
     body: commandPayloads
   });
   console.log("Commands registered.");
