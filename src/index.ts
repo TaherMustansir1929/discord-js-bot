@@ -1,7 +1,8 @@
 import "dotenv/config";
-import { Client, Events, GatewayIntentBits, MessageFlags } from "discord.js";
+import { createServer } from "node:http";
+import { Client, Events, GatewayIntentBits } from "discord.js";
 import { handleInteraction } from "./commands";
-import { startGoalReminderCron } from "./services/reminders";
+import { setReminderClient, startGoalReminderWorker } from "./services/reminders";
 
 const token = process.env.DISCORD_TOKEN;
 
@@ -15,7 +16,8 @@ const client = new Client({
 
 client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user?.tag}`);
-  startGoalReminderCron(client);
+  setReminderClient(client);
+  void startGoalReminderWorker();
 });
 
 client.on("interactionCreate", async (interaction) => {
@@ -27,12 +29,28 @@ client.on("interactionCreate", async (interaction) => {
       const hasReply = interaction.deferred || interaction.replied;
       const content = "Something went wrong while handling that interaction.";
       if (hasReply) {
-        await interaction.followUp({ content, flags: MessageFlags.Ephemeral });
+        await interaction.followUp({ content });
       } else {
-        await interaction.reply({ content, flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content });
       }
     }
   }
 });
 
 client.login(token);
+
+const healthPort = Number(process.env.HEALTHCHECK_PORT ?? "3000");
+const healthPath = process.env.HEALTHCHECK_PATH ?? "/healthz";
+
+createServer((req, res) => {
+  if (req.method === "GET" && req.url === healthPath) {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+    return;
+  }
+
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("not found");
+}).listen(healthPort, () => {
+  console.log(`Healthcheck listening on http://localhost:${healthPort}${healthPath}`);
+});

@@ -30,6 +30,9 @@ export const goals = pgTable("goals", {
   deadline: timestamp("deadline", { withTimezone: true, mode: "date" }).notNull(),
   status: goalStatusEnum("status").notNull().default("PENDING"),
   reminderSent: boolean("reminder_sent").notNull().default(false),
+  deadlineReminderSent: boolean("deadline_reminder_sent")
+    .notNull()
+    .default(false),
   createdAt: timestamp("created_at", { withTimezone: true, mode: "date" })
     .notNull()
     .defaultNow(),

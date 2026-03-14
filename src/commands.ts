@@ -4,7 +4,6 @@ import {
   ButtonStyle,
   ChatInputCommandInteraction,
   Interaction,
-  MessageFlags,
   ModalBuilder,
   SlashCommandBuilder,
   StringSelectMenuBuilder,
@@ -16,7 +15,7 @@ import { db } from "./db";
 import { expenses, goals, incomes } from "./db/schema";
 import { EXPENSE_CATEGORIES, GOAL_STATUSES, INCOME_CATEGORIES } from "./constants";
 import { formatShortDate, parseNaturalLanguageDate } from "./utils/date";
-import { renderTable } from "./utils/table";
+import { inngest } from "./services/inngest";
 
 type GoalStatus = (typeof GOAL_STATUSES)[number];
 type ExpenseCategory = (typeof EXPENSE_CATEGORIES)[number];
@@ -304,7 +303,7 @@ async function handleGoalCommand(interaction: ChatInputCommandInteraction) {
   const subcommand = interaction.options.getSubcommand();
 
   if (!interaction.guildId) {
-    await interaction.reply({ content: "Goals are only supported in servers.", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "Goals are only supported in servers." });
     return;
   }
 
@@ -344,18 +343,21 @@ async function handleGoalCommand(interaction: ChatInputCommandInteraction) {
       .orderBy(desc(goals.deadline));
 
     if (list.length === 0) {
-      await interaction.reply({ content: "No goals yet. Use /goal create to add one.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "No goals yet. Use /goal create to add one." });
       return;
     }
 
-    const rows = list.map((goal) => [
-      goal.id.toString(),
-      truncate(goal.name, 24),
-      formatShortDate(goal.deadline),
-      goal.status
-    ]);
-
-    const table = renderTable(["ID", "Name", "Deadline", "Status"], rows);
+    const byStatus = groupBy(list, (goal) => goal.status);
+    const sectionOrder = GOAL_STATUSES.filter((status) => byStatus.has(status));
+    const sections = sectionOrder.map((status) => {
+      const items = byStatus.get(status) ?? [];
+      items.sort((a, b) => b.deadline.getTime() - a.deadline.getTime());
+      const lines = items.map(
+        (goal) =>
+          `- #${goal.id} ${truncate(goal.name, 60)} — ${formatShortDate(goal.deadline)}`
+      );
+      return [`**${status}**`, ...lines].join("\n");
+    });
 
     const options = list.slice(0, 25).map((goal) => ({
       label: `#${goal.id} ${truncate(goal.name, 50)}`,
@@ -371,9 +373,8 @@ async function handleGoalCommand(interaction: ChatInputCommandInteraction) {
     const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select);
 
     await interaction.reply({
-      content: `\`\`\`\n${table}\n\`\`\`\nSelect a goal to update its status quickly.`,
-      components: [row],
-      flags: MessageFlags.Ephemeral
+      content: `${sections.join("\n\n")}\n\nSelect a goal to update its status quickly.`,
+      components: [row]
     });
     return;
   }
@@ -382,7 +383,7 @@ async function handleGoalCommand(interaction: ChatInputCommandInteraction) {
     const id = interaction.options.getInteger("id", true);
     const statusInput = interaction.options.getString("status", true);
     if (!isGoalStatus(statusInput)) {
-      await interaction.reply({ content: "Invalid goal status.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Invalid goal status." });
       return;
     }
     const status = statusInput;
@@ -394,13 +395,12 @@ async function handleGoalCommand(interaction: ChatInputCommandInteraction) {
       .returning();
 
     if (updated.length === 0) {
-      await interaction.reply({ content: "Goal not found.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Goal not found." });
       return;
     }
 
     await interaction.reply({
-      content: `Goal #${id} status updated to ${status}.`,
-      flags: MessageFlags.Ephemeral
+      content: `Goal #${id} status updated to ${status}.`
     });
     return;
   }
@@ -414,7 +414,7 @@ async function handleGoalCommand(interaction: ChatInputCommandInteraction) {
       .where(and(eq(goals.id, id), eq(goals.userId, interaction.user.id)));
 
     if (record.length === 0) {
-      await interaction.reply({ content: "Goal not found.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Goal not found." });
       return;
     }
 
@@ -455,7 +455,7 @@ async function handleGoalCreateModal(interaction: Interaction) {
   const deadline = parseNaturalLanguageDate(deadlineInput);
 
   if (!deadline) {
-    await interaction.reply({ content: "Could not parse the deadline. Try a clear date/time.", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "Could not parse the deadline. Try a clear date/time." });
     return;
   }
 
@@ -474,9 +474,20 @@ async function handleGoalCreateModal(interaction: Interaction) {
 
   const goal = inserted[0];
 
+  try {
+    await inngest.send({
+      name: "goal/deadline.scheduled",
+      data: {
+        goalId: goal.id,
+        deadline: goal.deadline.toISOString()
+      }
+    });
+  } catch (error) {
+    console.error("Failed to schedule deadline reminder", error);
+  }
+
   await interaction.reply({
-    content: `Goal created (#${goal.id}) with deadline ${formatShortDate(goal.deadline)}.`,
-    flags: MessageFlags.Ephemeral
+    content: `Goal created (#${goal.id}) with deadline ${formatShortDate(goal.deadline)}.`
   });
 }
 
@@ -491,13 +502,21 @@ async function handleGoalEditModal(interaction: Interaction, goalId: number) {
     .where(and(eq(goals.id, goalId), eq(goals.userId, interaction.user.id)));
 
   if (existing.length === 0) {
-    await interaction.reply({ content: "Goal not found.", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "Goal not found." });
     return;
   }
 
   const nameInput = interaction.fields.getTextInputValue("goal-name").trim();
   const deadlineInput = interaction.fields.getTextInputValue("goal-deadline").trim();
-  const updates: { name?: string; deadline?: Date; updatedAt: Date } = { updatedAt: new Date() };
+  const updates: {
+    name?: string;
+    deadline?: Date;
+    reminderSent?: boolean;
+    deadlineReminderSent?: boolean;
+    updatedAt: Date;
+  } = {
+    updatedAt: new Date()
+  };
 
   if (nameInput) {
     updates.name = nameInput;
@@ -506,17 +525,32 @@ async function handleGoalEditModal(interaction: Interaction, goalId: number) {
   if (deadlineInput) {
     const parsed = parseNaturalLanguageDate(deadlineInput);
     if (!parsed) {
-      await interaction.reply({ content: "Could not parse the deadline.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Could not parse the deadline." });
       return;
     }
     updates.deadline = parsed;
+    updates.reminderSent = false;
+    updates.deadlineReminderSent = false;
   }
 
   await db.update(goals).set(updates).where(eq(goals.id, goalId));
 
+  if (updates.deadline) {
+    try {
+      await inngest.send({
+        name: "goal/deadline.scheduled",
+        data: {
+          goalId,
+          deadline: updates.deadline.toISOString()
+        }
+      });
+    } catch (error) {
+      console.error("Failed to reschedule deadline reminder", error);
+    }
+  }
+
   await interaction.reply({
-    content: `Goal #${goalId} updated.`,
-    flags: MessageFlags.Ephemeral
+    content: `Goal #${goalId} updated.`
   });
 }
 
@@ -530,7 +564,7 @@ async function handleGoalStatusSelect(interaction: Interaction) {
     .where(and(eq(goals.id, Number(goalId)), eq(goals.userId, interaction.user.id)));
 
   if (goal.length === 0) {
-    await interaction.reply({ content: "Goal not found.", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "Goal not found." });
     return;
   }
 
@@ -545,8 +579,7 @@ async function handleGoalStatusSelect(interaction: Interaction) {
 
   await interaction.reply({
     content: `Pick a status for goal #${goalId}:`,
-    components: [row],
-    flags: MessageFlags.Ephemeral
+    components: [row]
   });
 }
 
@@ -555,7 +588,7 @@ async function handleGoalStatusButton(interaction: Interaction) {
 
   const [, goalId, statusInput] = interaction.customId.split(":");
   if (!statusInput || !isGoalStatus(statusInput)) {
-    await interaction.reply({ content: "Invalid goal status.", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "Invalid goal status." });
     return;
   }
   const status = statusInput;
@@ -566,13 +599,12 @@ async function handleGoalStatusButton(interaction: Interaction) {
     .returning();
 
   if (updated.length === 0) {
-    await interaction.reply({ content: "Goal not found.", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "Goal not found." });
     return;
   }
 
   await interaction.reply({
-    content: `Goal #${goalId} set to ${status}.`,
-    flags: MessageFlags.Ephemeral
+    content: `Goal #${goalId} set to ${status}.`
   });
 }
 
@@ -580,7 +612,7 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
   const sub = interaction.options.getSubcommand();
 
   if (!interaction.guildId) {
-    await interaction.reply({ content: "Expenses are only supported in servers.", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "Expenses are only supported in servers." });
     return;
   }
 
@@ -589,7 +621,7 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
     const amount = interaction.options.getNumber("amount", true);
     const categoryInput = interaction.options.getString("category", true);
     if (!isExpenseCategory(categoryInput)) {
-      await interaction.reply({ content: "Invalid expense category.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Invalid expense category." });
       return;
     }
     const category = categoryInput;
@@ -597,7 +629,7 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
     const date = dateText ? parseNaturalLanguageDate(dateText) : new Date();
 
     if (!date) {
-      await interaction.reply({ content: "Could not parse the date.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Could not parse the date." });
       return;
     }
 
@@ -614,8 +646,7 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
       .returning();
 
     await interaction.reply({
-      content: `Expense #${inserted[0].id} saved (${Math.round(amount)} PKR).`,
-      flags: MessageFlags.Ephemeral
+      content: `Expense #${inserted[0].id} saved (${Math.round(amount)} PKR).`
     });
     return;
   }
@@ -629,20 +660,23 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
       .limit(20);
 
     if (list.length === 0) {
-      await interaction.reply({ content: "No expenses yet.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "No expenses yet." });
       return;
     }
 
-    const rows = list.map((expense) => [
-      expense.id.toString(),
-      truncate(expense.description, 20),
-      expense.amountPkr.toString(),
-      formatShortDate(expense.date),
-      expense.category
-    ]);
+    const byCategory = groupBy(list, (expense) => expense.category);
+    const sectionOrder = EXPENSE_CATEGORIES.filter((cat) => byCategory.has(cat));
+    const sections = sectionOrder.map((cat) => {
+      const items = byCategory.get(cat) ?? [];
+      items.sort((a, b) => b.date.getTime() - a.date.getTime());
+      const lines = items.map(
+        (expense) =>
+          `- #${expense.id} ${truncate(expense.description, 60)} — ${expense.amountPkr} PKR — ${formatShortDate(expense.date)}`
+      );
+      return [`**${cat}**`, ...lines].join("\n");
+    });
 
-    const table = renderTable(["ID", "Desc", "PKR", "Date", "Category"], rows);
-    await interaction.reply({ content: `\`\`\`\n${table}\n\`\`\``, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: sections.join("\n\n") });
     return;
   }
 
@@ -664,7 +698,7 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
     if (amount !== null && amount !== undefined) updates.amountPkr = Math.round(amount);
     if (categoryInput) {
       if (!isExpenseCategory(categoryInput)) {
-        await interaction.reply({ content: "Invalid expense category.", flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content: "Invalid expense category." });
         return;
       }
       updates.category = categoryInput;
@@ -672,14 +706,14 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
     if (dateText) {
       const parsed = parseNaturalLanguageDate(dateText);
       if (!parsed) {
-        await interaction.reply({ content: "Could not parse the date.", flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content: "Could not parse the date." });
         return;
       }
       updates.date = parsed;
     }
 
     if (Object.keys(updates).length === 0) {
-      await interaction.reply({ content: "No updates provided.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "No updates provided." });
       return;
     }
 
@@ -690,11 +724,11 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
       .returning();
 
     if (updated.length === 0) {
-      await interaction.reply({ content: "Expense not found.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Expense not found." });
       return;
     }
 
-    await interaction.reply({ content: `Expense #${id} updated.`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `Expense #${id} updated.` });
     return;
   }
 
@@ -706,11 +740,11 @@ async function handleExpenseCommand(interaction: ChatInputCommandInteraction) {
       .returning();
 
     if (deleted.length === 0) {
-      await interaction.reply({ content: "Expense not found.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Expense not found." });
       return;
     }
 
-    await interaction.reply({ content: `Expense #${id} deleted.`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `Expense #${id} deleted.` });
   }
 }
 
@@ -718,7 +752,7 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
   const sub = interaction.options.getSubcommand();
 
   if (!interaction.guildId) {
-    await interaction.reply({ content: "Income tracking is only supported in servers.", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: "Income tracking is only supported in servers." });
     return;
   }
 
@@ -727,7 +761,7 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
     const amount = interaction.options.getNumber("amount", true);
     const categoryInput = interaction.options.getString("category", true);
     if (!isIncomeCategory(categoryInput)) {
-      await interaction.reply({ content: "Invalid income category.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Invalid income category." });
       return;
     }
     const category = categoryInput;
@@ -735,7 +769,7 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
     const date = dateText ? parseNaturalLanguageDate(dateText) : new Date();
 
     if (!date) {
-      await interaction.reply({ content: "Could not parse the date.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Could not parse the date." });
       return;
     }
 
@@ -752,8 +786,7 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
       .returning();
 
     await interaction.reply({
-      content: `Income #${inserted[0].id} saved (${Math.round(amount)} PKR).`,
-      flags: MessageFlags.Ephemeral
+      content: `Income #${inserted[0].id} saved (${Math.round(amount)} PKR).`
     });
     return;
   }
@@ -767,20 +800,23 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
       .limit(20);
 
     if (list.length === 0) {
-      await interaction.reply({ content: "No income yet.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "No income yet." });
       return;
     }
 
-    const rows = list.map((income) => [
-      income.id.toString(),
-      truncate(income.description, 20),
-      income.amountPkr.toString(),
-      formatShortDate(income.date),
-      income.category
-    ]);
+    const byCategory = groupBy(list, (income) => income.category);
+    const sectionOrder = INCOME_CATEGORIES.filter((cat) => byCategory.has(cat));
+    const sections = sectionOrder.map((cat) => {
+      const items = byCategory.get(cat) ?? [];
+      items.sort((a, b) => b.date.getTime() - a.date.getTime());
+      const lines = items.map(
+        (income) =>
+          `- #${income.id} ${truncate(income.description, 60)} — ${income.amountPkr} PKR — ${formatShortDate(income.date)}`
+      );
+      return [`**${cat}**`, ...lines].join("\n");
+    });
 
-    const table = renderTable(["ID", "Desc", "PKR", "Date", "Category"], rows);
-    await interaction.reply({ content: `\`\`\`\n${table}\n\`\`\``, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: sections.join("\n\n") });
     return;
   }
 
@@ -802,7 +838,7 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
     if (amount !== null && amount !== undefined) updates.amountPkr = Math.round(amount);
     if (categoryInput) {
       if (!isIncomeCategory(categoryInput)) {
-        await interaction.reply({ content: "Invalid income category.", flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content: "Invalid income category." });
         return;
       }
       updates.category = categoryInput;
@@ -810,14 +846,14 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
     if (dateText) {
       const parsed = parseNaturalLanguageDate(dateText);
       if (!parsed) {
-        await interaction.reply({ content: "Could not parse the date.", flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content: "Could not parse the date." });
         return;
       }
       updates.date = parsed;
     }
 
     if (Object.keys(updates).length === 0) {
-      await interaction.reply({ content: "No updates provided.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "No updates provided." });
       return;
     }
 
@@ -828,11 +864,11 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
       .returning();
 
     if (updated.length === 0) {
-      await interaction.reply({ content: "Income record not found.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Income record not found." });
       return;
     }
 
-    await interaction.reply({ content: `Income #${id} updated.`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `Income #${id} updated.` });
     return;
   }
 
@@ -844,11 +880,11 @@ async function handleIncomeCommand(interaction: ChatInputCommandInteraction) {
       .returning();
 
     if (deleted.length === 0) {
-      await interaction.reply({ content: "Income record not found.", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "Income record not found." });
       return;
     }
 
-    await interaction.reply({ content: `Income #${id} deleted.`, flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: `Income #${id} deleted.` });
   }
 }
 
@@ -856,4 +892,18 @@ function truncate(text: string, max: number) {
   if (text.length <= max) return text;
   if (max <= 3) return text.slice(0, max);
   return `${text.slice(0, max - 3)}...`;
+}
+
+function groupBy<T, K>(items: T[], keyFn: (item: T) => K): Map<K, T[]> {
+  const map = new Map<K, T[]>();
+  for (const item of items) {
+    const key = keyFn(item);
+    const group = map.get(key);
+    if (group) {
+      group.push(item);
+    } else {
+      map.set(key, [item]);
+    }
+  }
+  return map;
 }
